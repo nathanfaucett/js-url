@@ -1,0 +1,31 @@
+{
+  "name": "@nathanfaucett/url",
+  "version": "0.0.1",
+  "description": "url parsing and objects for the browser and node.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nathanfaucett/url.git"
+  },
+  "main": "src/index.js",
+  "keywords": [
+    "url",
+    "url.js"
+  ],
+  "author": "Nathan Faucett",
+  "license": "MIT",
+  "readmeFilename": "README.md",
+  "devDependencies": {
+    "grunt": "^1.0.1",
+    "grunt-contrib-jshint": "^1.0.0",
+    "grunt-jsbeautifier": "^0.2.13"
+  },
+  "dependencies": {
+    "@nathanfaucett/is_null": "^0.0.1",
+    "@nathanfaucett/is_null_or_undefined": "^0.0.1",
+    "@nathanfaucett/is_object": "^0.0.1",
+    "@nathanfaucett/is_string": "^0.0.1",
+    "punycode": "^1.3.2",
+    "@nathanfaucett/qs": "^0.0.1",
+    "@nathanfaucett/url_path": "^0.0.1"
+  }
+}
