@@ -1,12 +1,18 @@
 {
   "name": "@nathanfaucett/url",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "url parsing and objects for the browser and node.js",
   "repository": {
     "type": "git",
     "url": "https://github.com/nathanfaucett/url.git"
   },
   "main": "src/index.js",
+  "scripts": {
+    "test": "npm run test-node",
+    "test-node": "node ./test | ./node_modules/.bin/tap-spec",
+    "test-node-raw": "node ./test",
+    "test-browser-local": "zuul --local 9999 --ui tape -- ./test"
+  },
   "keywords": [
     "url",
     "url.js"
@@ -15,15 +21,20 @@
   "license": "MIT",
   "readmeFilename": "README.md",
   "devDependencies": {
+    "tap-spec": "^4.1.0",
+    "tape": "^4.2.0",
+    "zuul": "^3.6.0",
     "grunt": "^1.0.1",
     "grunt-contrib-jshint": "^1.0.0",
     "grunt-jsbeautifier": "^0.2.13"
   },
   "dependencies": {
     "@nathanfaucett/is_null": "^0.0.1",
-    "@nathanfaucett/is_null_or_undefined": "^0.0.1",
+    "@nathanfaucett/is_undefined": "^0.0.1",
     "@nathanfaucett/is_object": "^0.0.1",
     "@nathanfaucett/is_string": "^0.0.1",
+    "@nathanfaucett/create": "^0.0.2",
+    "@nathanfaucett/keys": "^0.0.2",
     "punycode": "^1.3.2",
     "@nathanfaucett/qs": "^0.0.2",
     "@nathanfaucett/url_path": "^0.0.1"

@@ -1,44 +1,58 @@
 var isObject = require("@nathanfaucett/is_object"),
     isString = require("@nathanfaucett/is_string"),
-    isNullOrUndefined = require("@nathanfaucett/is_null_or_undefined"),
+    isUndefined = require("@nathanfaucett/is_undefined"),
     isNull = require("@nathanfaucett/is_null"),
+    create = require("@nathanfaucett/create"),
+    keys = require("@nathanfaucett/keys"),
     punycode = require("punycode"),
     qs = require("@nathanfaucett/qs");
 
 
-var url = module.exports,
+// Reference: RFC 3986, RFC 1808, RFC 2396
+
+// define these here so at least they only have to be
+// compiled once on the first module load.
+var url = exports,
+    toASCII = punycode.toASCII,
 
     protocolPattern = /^([a-z0-9.+-]+:)/i,
     portPattern = /:[0-9]*$/,
+
+    // Special case for a simple path URL
     simplePathPattern = /^(\/\/?(?!\/)[^\?\s]*)(\?[^\s]*)?$/,
-    delims = ["<", ">", '"', "`", " ", "\r", "\n", "	"],
-    unwise = ["{", "}", "|", "\\", "^", "`"].concat(delims),
-    autoEscape = ["'"].concat(unwise),
-    nonHostChars = ["%", "/", "?", ";", "#"].concat(autoEscape),
-    hostEndingChars = ["/", "?", "#"],
+
     hostnameMaxLen = 255,
-    hostnamePartPattern = /^[a-z0-9A-Z_-]{0,63}$/,
-    hostnamePartStart = /^([a-z0-9A-Z_-]{0,63})(.*)$/,
+    // protocols that can allow "unsafe" and "unwise" chars.
     unsafeProtocol = {
-        javascript: true,
-        "javascript:": true
+        'javascript': true,
+        'javascript:': true
     },
+    // protocols that never have a hostname.
     hostlessProtocol = {
-        javascript: true,
-        "javascript:": true
+        'javascript': true,
+        'javascript:': true
     },
+    // protocols that always contain a // bit.
     slashedProtocol = {
-        http: true,
-        https: true,
-        ftp: true,
-        gopher: true,
-        file: true,
-        "http:": true,
-        "https:": true,
-        "ftp:": true,
-        "gopher:": true,
-        "file:": true
+        'http': true,
+        'http:': true,
+        'https': true,
+        'https:': true,
+        'ftp': true,
+        'ftp:': true,
+        'gopher': true,
+        'gopher:': true,
+        'file': true,
+        'file:': true
     };
+
+
+url.parse = urlParse;
+url.resolve = urlResolve;
+url.resolveObject = urlResolveObject;
+url.format = urlFormat;
+
+url.Url = Url;
 
 
 function Url() {
@@ -56,179 +70,624 @@ function Url() {
     this.href = null;
 }
 
+
+
+// This constructor is used to store parsed query string values. Instantiating
+// this is faster than explicitly calling `Object.create(null)` to get a
+// "clean" empty object (tested with v8 v4.9).
+function ParsedQueryString() {}
+ParsedQueryString.prototype = create(null);
+
 function urlParse(url, parseQueryString, slashesDenoteHost) {
-    if (url && isObject(url) && url instanceof Url) {
+    var u;
+
+    if (url instanceof Url) {
         return url;
+    } else {
+        u = new Url();
+        u.parse(url, parseQueryString, slashesDenoteHost);
+        return u;
     }
-    var u = new Url();
-    u.parse(url, parseQueryString, slashesDenoteHost);
-    return u;
 }
 
 Url.prototype.parse = function(url, parseQueryString, slashesDenoteHost) {
-    var hashSplit, rest, simplePath, proto, lowerProto, slashes, hostEnd, i, hec, auth, atSign, ipv6Hostname, hostparts, l, part, newpart, j, k, validParts, notHost, bit, p, h, ae, esc, hash, qm, s;
     if (!isString(url)) {
-        throw new TypeError("Parameter 'url' must be a string, not " + typeof(url));
+        throw new TypeError('Parameter "url" must be a string, not ' + typeof url);
     }
-    hashSplit = url.split("#");
-    hashSplit[0] = hashSplit[0].replace(/\\/g, "/");
-    url = hashSplit.join("#");
-    rest = url;
-    rest = rest.trim();
-    if (!slashesDenoteHost && 1 === hashSplit.length) {
+    // Copy chrome, IE, opera backslash-handling behavior.
+    // Back slashes before the query string get converted to forward slashes
+    // See: https://code.google.com/p/chromium/issues/detail?id=25916
+    var hasHash = false,
+        start = -1,
+        end = -1,
+        rest = '',
+        lastPos = 0,
+        i = 0,
+        inWs, code, simplePath, proto, lowerProto, slashes, hostEnd, atSign,
+        nonHost, hostname, ipv6Hostname, result, p, h, questionIdx, hashIdx,
+        firstIdx, s;
+
+    for (inWs = false, split = false; i < url.length; ++i) {
+        code = url.charCodeAt(i);
+
+        // Find first and last non-whitespace characters for trimming
+        isWs = code === 32 /* */ ||
+            code === 9 /*\t*/ ||
+            code === 13 /*\r*/ ||
+            code === 10 /*\n*/ ||
+            code === 12 /*\f*/ ||
+            code === 160 /*\u00A0*/ ||
+            code === 65279 /*\uFEFF*/ ;
+
+        if (start === -1) {
+            if (isWs) {
+                continue;
+            }
+            lastPos = start = i;
+        } else {
+            if (inWs) {
+                if (!isWs) {
+                    end = -1;
+                    inWs = false;
+                }
+            } else if (isWs) {
+                end = i;
+                inWs = true;
+            }
+        }
+
+        // Only convert backslashes while we haven't seen a split character
+        if (!split) {
+            switch (code) {
+                case 35: // '#'
+                    hasHash = true;
+                    /* falls through */
+                case 63: // '?'
+                    split = true;
+                    break;
+                case 92: // '\\'
+                    if (i - lastPos > 0) {
+                        rest += url.slice(lastPos, i);
+                    }
+                    rest += '/';
+                    lastPos = i + 1;
+                    break;
+            }
+        } else if (!hasHash && code === 35 /*#*/ ) {
+            hasHash = true;
+        }
+    }
+
+    // Check if string was non-empty (including strings with only whitespace)
+    if (start !== -1) {
+        if (lastPos === start) {
+            // We didn't convert any backslashes
+
+            if (end === -1) {
+                if (start === 0) {
+                    rest = url;
+                } else {
+                    rest = url.slice(start);
+                }
+            } else {
+                rest = url.slice(start, end);
+            }
+        } else if (end === -1 && lastPos < url.length) {
+            // We converted some backslashes and have only part of the entire string
+            rest += url.slice(lastPos);
+        } else if (end !== -1 && lastPos < end) {
+            // We converted some backslashes and have only part of the entire string
+            rest += url.slice(lastPos, end);
+        }
+    }
+
+    if (!slashesDenoteHost && !hasHash) {
+        // Try fast path regexp
         simplePath = simplePathPattern.exec(rest);
+
         if (simplePath) {
             this.path = rest;
             this.href = rest;
             this.pathname = simplePath[1];
             if (simplePath[2]) {
                 this.search = simplePath[2];
-                this.query = parseQueryString ? qs.parse(this.search.substr(1)) : this.search.substr(1);
+                if (parseQueryString) {
+                    this.query = qs.parse(this.search.slice(1));
+                } else {
+                    this.query = this.search.slice(1);
+                }
+            } else if (parseQueryString) {
+                this.search = '';
+                this.query = new ParsedQueryString();
             }
             return this;
         }
     }
+
     proto = protocolPattern.exec(rest);
     if (proto) {
         proto = proto[0];
         lowerProto = proto.toLowerCase();
         this.protocol = lowerProto;
-        rest = rest.substr(proto.length);
+        rest = rest.slice(proto.length);
     }
-    if (slashesDenoteHost || proto || rest.match(/^\/\/[^@\/]+@[^@\/]+/)) {
-        slashes = "//" === rest.substr(0, 2);
+
+    // figure out if it's got a host
+    // user@server is *always* interpreted as a hostname, and url
+    // resolution will treat //foo/bar as host=foo,path=bar because that's
+    // how the browser resolves relative URLs.
+    if (slashesDenoteHost || proto || /^\/\/[^@\/]+@[^@\/]+/.test(rest)) {
+        slashes = rest.charCodeAt(0) === 47 && rest.charCodeAt(1) === 47;
         if (slashes && !(proto && hostlessProtocol[proto])) {
-            rest = rest.substr(2);
+            rest = rest.slice(2);
             this.slashes = true;
         }
     }
-    if (!hostlessProtocol[proto] && (slashes || proto && !slashedProtocol[proto])) {
+
+    if (!hostlessProtocol[proto] &&
+        (slashes || (proto && !slashedProtocol[proto]))) {
+
+        // there's a hostname.
+        // the first instance of /, ?, ;, or # ends the host.
+        //
+        // If there is an @ in the hostname, then non-host chars *are* allowed
+        // to the left of the last @ sign, unless some host-ending character
+        // comes *before* the @-sign.
+        // URLs are obnoxious.
+        //
+        // ex:
+        // http://a@b@c/ => user:a@b host:c
+        // http://a@b?@c => user:a host:b path:/?@c
+
+        // v0.12 TODO(isaacs): This is not quite how Chrome does things.
+        // Review our test case against browsers more comprehensively.
+
         hostEnd = -1;
-        for (i = 0; i < hostEndingChars.length; i++) {
-            hec = rest.indexOf(hostEndingChars[i]); - 1 === hec || -1 !== hostEnd && hec >= hostEnd || (hostEnd = hec);
-        }
-        atSign = -1 === hostEnd ? rest.lastIndexOf("@") : rest.lastIndexOf("@", hostEnd);
-        if (-1 !== atSign) {
-            auth = rest.slice(0, atSign);
-            rest = rest.slice(atSign + 1);
-            this.auth = decodeURIComponent(auth);
-        }
-        hostEnd = -1;
-        for (i = 0; i < nonHostChars.length; i++) {
-            hec = rest.indexOf(nonHostChars[i]); - 1 === hec || -1 !== hostEnd && hec >= hostEnd || (hostEnd = hec);
-        } - 1 === hostEnd && (hostEnd = rest.length);
-        this.host = rest.slice(0, hostEnd);
-        rest = rest.slice(hostEnd);
-        this.parseHost();
-        this.hostname = this.hostname || "";
-        ipv6Hostname = "[" === this.hostname[0] && "]" === this.hostname[this.hostname.length - 1];
-        if (!ipv6Hostname) {
-            hostparts = this.hostname.split(/\./);
-            for (i = 0, l = hostparts.length; l > i; i++) {
-                part = hostparts[i];
-                if (part && !part.match(hostnamePartPattern)) {
-                    newpart = "";
-                    for (j = 0, k = part.length; k > j; j++) {
-                        newpart += part.charCodeAt(j) > 127 ? "x" : part[j];
+        atSign = -1;
+        nonHost = -1;
+        for (i = 0; i < rest.length; i++) {
+            switch (rest.charCodeAt(i)) {
+                case 9: // '\t'
+                case 10: // '\n'
+                case 13: // '\r'
+                case 32: // ' '
+                case 34: // '"'
+                case 37: // '%'
+                case 39: // '\''
+                case 59: // ';'
+                case 60: // '<'
+                case 62: // '>'
+                case 92: // '\\'
+                case 94: // '^'
+                case 96: // '`'
+                case 123: // '{'
+                case 124: // '|'
+                case 125: // '}'
+                    // Characters that are never ever allowed in a hostname from RFC 2396
+                    if (nonHost === -1) {
+                        nonHost = i;
                     }
-                    if (!newpart.match(hostnamePartPattern)) {
-                        validParts = hostparts.slice(0, i);
-                        notHost = hostparts.slice(i + 1);
-                        bit = part.match(hostnamePartStart);
-                        if (bit) {
-                            validParts.push(bit[1]);
-                            notHost.unshift(bit[2]);
-                        }
-                        notHost.length && (rest = "/" + notHost.join(".") + rest);
-                        this.hostname = validParts.join(".");
-                        break;
+                    break;
+                case 35: // '#'
+                case 47: // '/'
+                case 63: // '?'
+                    // Find the first instance of any host-ending characters
+                    if (nonHost === -1) {
+                        nonHost = i;
                     }
-                }
+                    hostEnd = i;
+                    break;
+                case 64: // '@'
+                    // At this point, either we have an explicit point where the
+                    // auth portion cannot go past, or the last @ char is the decider.
+                    atSign = i;
+                    nonHost = -1;
+                    break;
+            }
+            if (hostEnd !== -1) {
+                break;
             }
         }
-        this.hostname = this.hostname.length > hostnameMaxLen ? "" : this.hostname.toLowerCase();
-        ipv6Hostname || (this.hostname = punycode.toASCII(this.hostname));
-        p = this.port ? ":" + this.port : "";
-        h = this.hostname || "";
+        start = 0;
+        if (atSign !== -1) {
+            this.auth = decodeURIComponent(rest.slice(0, atSign));
+            start = atSign + 1;
+        }
+        if (nonHost === -1) {
+            this.host = rest.slice(start);
+            rest = '';
+        } else {
+            this.host = rest.slice(start, nonHost);
+            rest = rest.slice(nonHost);
+        }
+
+        // pull out port.
+        this.parseHost();
+
+        // we've indicated that there is a hostname,
+        // so even if it's empty, it has to be present.
+        if (!isString(this.hostname)) {
+            this.hostname = '';
+        }
+
+        hostname = this.hostname;
+
+        // if hostname begins with [ and ends with ]
+        // assume that it's an IPv6 address.
+        ipv6Hostname = hostname.charCodeAt(0) === 91 && hostname.charCodeAt(hostname.length - 1) === 93;
+
+        // validate a little.
+        if (!ipv6Hostname) {
+            result = validateHostname(this, rest, hostname);
+            if (!isUndefined(result)) {
+                rest = result;
+            }
+        }
+
+        if (this.hostname.length > hostnameMaxLen) {
+            this.hostname = '';
+        } else {
+            // hostnames are always lower case.
+            this.hostname = this.hostname.toLowerCase();
+        }
+
+        if (!ipv6Hostname) {
+            // IDNA Support: Returns a punycoded representation of "domain".
+            // It only converts parts of the domain name that
+            // have non-ASCII characters, i.e. it doesn't matter if
+            // you call it with a domain that already is ASCII-only.
+            this.hostname = toASCII(this.hostname);
+        }
+
+        p = this.port ? ':' + this.port : '';
+        h = this.hostname || '';
         this.host = h + p;
-        this.href += this.host;
+
+        // strip [ and ] from the hostname
+        // the host field still retains them, though
         if (ipv6Hostname) {
-            this.hostname = this.hostname.substr(1, this.hostname.length - 2);
-            "/" !== rest[0] && (rest = "/" + rest);
+            this.hostname = this.hostname.slice(1, -1);
+            if (rest[0] !== '/') {
+                rest = '/' + rest;
+            }
         }
     }
+
+    // now rest is set to the post-host stuff.
+    // chop off any delim chars.
     if (!unsafeProtocol[lowerProto]) {
-        for (i = 0, l = autoEscape.length; l > i; i++) {
-            ae = autoEscape[i];
-            esc = encodeURIComponent(ae);
-            esc === ae && (esc = escape(ae));
-            rest = rest.split(ae).join(esc);
+        // First, make 100% sure that any "autoEscape" chars get
+        // escaped, even if encodeURIComponent doesn't think they
+        // need to be.
+        result = autoEscapeStr(rest);
+        if (!isUndefined(result)) {
+            rest = result;
         }
     }
-    hash = rest.indexOf("#");
-    if (-1 !== hash) {
-        this.hash = rest.substr(hash);
-        rest = rest.slice(0, hash);
+
+    questionIdx = -1;
+    hashIdx = -1;
+    for (i = 0; i < rest.length; ++i) {
+        code = rest.charCodeAt(i);
+        if (code === 35 /*#*/ ) {
+            this.hash = rest.slice(i);
+            hashIdx = i;
+            break;
+        } else if (code === 63 /*?*/ && questionIdx === -1) {
+            questionIdx = i;
+        }
     }
-    qm = rest.indexOf("?");
-    if (-1 !== qm) {
-        this.search = rest.substr(qm);
-        this.query = rest.substr(qm + 1);
-        parseQueryString && (this.query = qs.parse(this.query));
-        rest = rest.slice(0, qm);
-    } else {
+
+    if (questionIdx !== -1) {
+        if (hashIdx === -1) {
+            this.search = rest.slice(questionIdx);
+            this.query = rest.slice(questionIdx + 1);
+        } else {
+            this.search = rest.slice(questionIdx, hashIdx);
+            this.query = rest.slice(questionIdx + 1, hashIdx);
+        }
         if (parseQueryString) {
-            this.search = "";
-            this.query = {};
+            this.query = qs.parse(this.query);
         }
+    } else if (parseQueryString) {
+        // no query string, but parseQueryString still requested
+        this.search = '';
+        this.query = new ParsedQueryString();
     }
-    rest && (this.pathname = rest);
-    slashedProtocol[lowerProto] && this.hostname && !this.pathname && (this.pathname = "/");
+
+    firstIdx = (
+        questionIdx !== -1 && (hashIdx === -1 || questionIdx < hashIdx) ?
+        questionIdx :
+        hashIdx
+    );
+
+    if (firstIdx === -1) {
+        if (rest.length > 0) {
+            this.pathname = rest;
+        }
+    } else if (firstIdx > 0) {
+        this.pathname = rest.slice(0, firstIdx);
+    }
+    if (slashedProtocol[lowerProto] &&
+        this.hostname && !this.pathname) {
+        this.pathname = '/';
+    }
+
+    // to support http.request
     if (this.pathname || this.search) {
-        p = this.pathname || "";
-        s = this.search || "";
+        p = this.pathname || '';
+        s = this.search || '';
         this.path = p + s;
     }
+
+    // finally, reconstruct the href based on what has been validated.
     this.href = this.format();
+
     return this;
 };
 
+function validateHostname(self, rest, hostname) {
+    var i, lastPos, code;
+
+    for (i = 0, lastPos; i <= hostname.length; ++i) {
+        if (i < hostname.length) {
+            code = hostname.charCodeAt(i);
+        }
+        if (code === 46 /*.*/ || i === hostname.length) {
+            if (i - lastPos > 0) {
+                if (i - lastPos > 63) {
+                    self.hostname = hostname.slice(0, lastPos + 63);
+                    return '/' + hostname.slice(lastPos + 63) + rest;
+                }
+            }
+            lastPos = i + 1;
+            continue;
+        } else if ((code >= 48 /*0*/ && code <= 57 /*9*/ ) ||
+            (code >= 97 /*a*/ && code <= 122 /*z*/ ) ||
+            code === 45 /*-*/ ||
+            (code >= 65 /*A*/ && code <= 90 /*Z*/ ) ||
+            code === 43 /*+*/ ||
+            code === 95 /*_*/ ||
+            code > 127) {
+            continue;
+        }
+        // Invalid host character
+        self.hostname = hostname.slice(0, i);
+        if (i < hostname.length) {
+            return '/' + hostname.slice(i) + rest;
+        }
+        break;
+    }
+}
+
+function autoEscapeStr(rest) {
+    var newRest = '',
+        lastPos = 0,
+        i;
+    for (i = 0; i < rest.length; i++) {
+        // Automatically escape all delimiters and unwise characters from RFC 2396
+        // Also escape single quotes in case of an XSS attack
+        switch (rest.charCodeAt(i)) {
+            case 9: // '\t'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%09';
+                lastPos = i + 1;
+                break;
+            case 10: // '\n'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%0A';
+                lastPos = i + 1;
+                break;
+            case 13: // '\r'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%0D';
+                lastPos = i + 1;
+                break;
+            case 32: // ' '
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%20';
+                lastPos = i + 1;
+                break;
+            case 34: // '"'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%22';
+                lastPos = i + 1;
+                break;
+            case 39: // '\''
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%27';
+                lastPos = i + 1;
+                break;
+            case 60: // '<'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%3C';
+                lastPos = i + 1;
+                break;
+            case 62: // '>'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%3E';
+                lastPos = i + 1;
+                break;
+            case 92: // '\\'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%5C';
+                lastPos = i + 1;
+                break;
+            case 94: // '^'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%5E';
+                lastPos = i + 1;
+                break;
+            case 96: // '`'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%60';
+                lastPos = i + 1;
+                break;
+            case 123: // '{'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%7B';
+                lastPos = i + 1;
+                break;
+            case 124: // '|'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%7C';
+                lastPos = i + 1;
+                break;
+            case 125: // '}'
+                if (i - lastPos > 0) {
+                    newRest += rest.slice(lastPos, i);
+                }
+                newRest += '%7D';
+                lastPos = i + 1;
+                break;
+        }
+    }
+    if (lastPos === 0) {
+        return;
+    }
+    if (lastPos < rest.length) {
+        return newRest + rest.slice(lastPos);
+    } else {
+        return newRest;
+    }
+}
+
+// format a parsed object into a url string
 function urlFormat(obj) {
-    isString(obj) && (obj = urlParse(obj));
-    return obj instanceof Url ? obj.format() : Url.prototype.format.call(obj);
+    // ensure it's an object, and not a string url.
+    // If it's an obj, this is a no-op.
+    // this way, you can call url_format() on strings
+    // to clean up potentially wonky urls.
+    if (isString(obj)) {
+        obj = urlParse(obj);
+    } else if (!isObject(obj) || isNull(obj)) {
+        throw new TypeError('Parameter "urlObj" must be an object, not ' +
+            isNull(obj) ? 'null' : typeof obj);
+    } else if (!(obj instanceof Url)) {
+        return Url.prototype.format.call(obj);
+    } else {
+        return obj.format();
+    }
 }
 
 Url.prototype.format = function() {
-    var protocol, pathname, hash, host, query, search, auth = this.auth || "";
+    var auth = this.auth || '',
+        protocol, pathname, hash, host, query, search, newPathname, lastPos, i;
+
     if (auth) {
-        auth = encodeURIComponent(auth);
-        auth = auth.replace(/%3A/i, ":");
-        auth += "@";
+        auth = encodeAuth(auth);
+        auth += '@';
     }
-    protocol = this.protocol || "", pathname = this.pathname || "", hash = this.hash || "", host = false, query = "";
+
+    protocol = this.protocol || '';
+    pathname = this.pathname || '';
+    hash = this.hash || '';
+    host = '';
+    query = '';
+
     if (this.host) {
         host = auth + this.host;
-    } else {
-        if (this.hostname) {
-            host = auth + (-1 === this.hostname.indexOf(":") ? this.hostname : "[" + this.hostname + "]");
-            this.port && (host += ":" + this.port);
+    } else if (this.hostname) {
+        host = (
+            auth + (this.hostname.indexOf(':') === -1 ?
+                this.hostname :
+                '[' + this.hostname + ']')
+        );
+        if (this.port) {
+            host += ':' + this.port;
         }
     }
-    this.query && isObject(this.query) && Object.keys(this.query).length && (query = qs.stringify(this.query));
-    search = this.search || query && "?" + query || "";
-    protocol && ":" !== protocol.substr(-1) && (protocol += ":");
-    if (this.slashes || (!protocol || slashedProtocol[protocol]) && false !== host) {
-        host = "//" + (host || "");
-        pathname && "/" !== pathname.charAt(0) && (pathname = "/" + pathname);
-    } else {
-        host || (host = "");
+
+    if (isNull(this.query) && isObject(this.query)) {
+        query = qs.stringify(this.query);
     }
-    hash && "#" !== hash.charAt(0) && (hash = "#" + hash);
-    search && "?" !== search.charAt(0) && (search = "?" + search);
-    pathname = pathname.replace(/[?#]/g, function(match) {
-        return encodeURIComponent(match);
-    });
-    search = search.replace("#", "%23");
+
+    search = this.search || (query && ('?' + query)) || '';
+
+    if (protocol && protocol.charCodeAt(protocol.length - 1) !== 58 /*:*/ ) {
+        protocol += ':';
+    }
+
+    newPathname = '';
+    lastPos = 0;
+    for (i = 0; i < pathname.length; ++i) {
+        switch (pathname.charCodeAt(i)) {
+            case 35: // '#'
+                if (i - lastPos > 0) {
+                    newPathname += pathname.slice(lastPos, i);
+                }
+                newPathname += '%23';
+                lastPos = i + 1;
+                break;
+            case 63: // '?'
+                if (i - lastPos > 0) {
+                    newPathname += pathname.slice(lastPos, i);
+                }
+                newPathname += '%3F';
+                lastPos = i + 1;
+                break;
+        }
+    }
+    if (lastPos > 0) {
+        if (lastPos !== pathname.length) {
+            pathname = newPathname + pathname.slice(lastPos);
+        } else {
+            pathname = newPathname;
+        }
+    }
+
+    // only the slashedProtocols get the //.  Not mailto:, xmpp:, etc.
+    // unless they had them to begin with.
+    if (this.slashes || slashedProtocol[protocol]) {
+        if (this.slashes || host) {
+            if (pathname && pathname.charCodeAt(0) !== 47 /*/*/ ) {
+                pathname = '/' + pathname;
+            }
+            host = '//' + host;
+        } else if (protocol.length >= 4 &&
+            protocol.charCodeAt(0) === 102 /*f*/ &&
+            protocol.charCodeAt(1) === 105 /*i*/ &&
+            protocol.charCodeAt(2) === 108 /*l*/ &&
+            protocol.charCodeAt(3) === 101 /*e*/ ) {
+            host = '//';
+        }
+    }
+
+    search = search.replace(/#/g, '%23');
+
+    if (hash && hash.charCodeAt(0) !== 35 /*#*/ ) {
+        hash = '#' + hash;
+    }
+    if (search && search.charCodeAt(0) !== 63 /*?*/ ) {
+        search = '?' + search;
+    }
+
     return protocol + host + pathname + search + hash;
 };
 
@@ -241,193 +700,412 @@ Url.prototype.resolve = function(relative) {
 };
 
 function urlResolveObject(source, relative) {
-    return source ? urlParse(source, false, true).resolveObject(relative) : relative;
+    if (!source) {
+        return relative;
+    }
+    return urlParse(source, false, true).resolveObject(relative);
 }
 
 Url.prototype.resolveObject = function(relative) {
-    var rel, result, tkeys, tk, tkey, rkeys, rk, rkey, keys, v, k, relPath, p, s, isSourceAbs, isRelAbs, mustEndAbs, removeAllDots, srcPath, psychotic, authInHost, last, hasTrailingSlash, up, i, isAbsolute;
+    var rel, result, tkeys, tk, tkey, rkeys, rk, ks, v, k, relPath, p, s,
+        isSourceAbs, isRelAbs, mustEndAbs, removeAllDots, srcPath, psychotic,
+        authInHost, last, hasTrailingSlash, up, i, isAbsolute;
+
     if (isString(relative)) {
         rel = new Url();
         rel.parse(relative, false, true);
         relative = rel;
     }
+
     result = new Url();
-    tkeys = Object.keys(this);
+    tkeys = keys(this);
     for (tk = 0; tk < tkeys.length; tk++) {
         tkey = tkeys[tk];
         result[tkey] = this[tkey];
     }
+
+    // hash is always overridden, no matter what.
+    // even href="" will remove it.
     result.hash = relative.hash;
-    if ("" === relative.href) {
+
+    // if the relative url is empty, then there's nothing left to do here.
+    if (relative.href === '') {
         result.href = result.format();
         return result;
     }
+
+    // hrefs like //foo/bar always cut to the protocol.
     if (relative.slashes && !relative.protocol) {
-        rkeys = Object.keys(relative);
+        // take everything except the protocol from relative
+        rkeys = keys(relative);
+
         for (rk = 0; rk < rkeys.length; rk++) {
             rkey = rkeys[rk];
-            "protocol" !== rkey && (result[rkey] = relative[rkey]);
+            if (rkey !== 'protocol') {
+                result[rkey] = relative[rkey];
+            }
         }
-        slashedProtocol[result.protocol] && result.hostname && !result.pathname && (result.path = result.pathname = "/");
+
+        //urlParse appends trailing / to urls like http://www.example.com
+        if (slashedProtocol[result.protocol] &&
+            result.hostname && !result.pathname) {
+            result.path = result.pathname = '/';
+        }
+
         result.href = result.format();
+
         return result;
     }
+
     if (relative.protocol && relative.protocol !== result.protocol) {
+        // if it's a known url protocol, then changing
+        // the protocol does weird things
+        // first, if it's not file:, then we MUST have a host,
+        // and if there was a path
+        // to begin with, then we MUST have a path.
+        // if it is file:, then the host is dropped,
+        // because that's known to be hostless.
+        // anything else is assumed to be absolute.
         if (!slashedProtocol[relative.protocol]) {
-            keys = Object.keys(relative);
-            for (v = 0; v < keys.length; v++) {
-                k = keys[v];
+            ks = keys(relative);
+            for (v = 0; v < ks.length; v++) {
+                k = ks[v];
                 result[k] = relative[k];
             }
             result.href = result.format();
             return result;
         }
+
         result.protocol = relative.protocol;
-        if (relative.host || hostlessProtocol[relative.protocol]) {
-            result.pathname = relative.pathname;
+        if (!relative.host &&
+            !/^file:?$/.test(relative.protocol) &&
+            !hostlessProtocol[relative.protocol]) {
+            relPath = (relative.pathname || '').split('/');
+            while (relPath.length && !(relative.host = relPath.shift())) {}
+            if (!relative.host) {
+                relative.host = '';
+            }
+            if (!relative.hostname) {
+                relative.hostname = '';
+            }
+            if (relPath[0] !== '') {
+                relPath.unshift('');
+            }
+            if (relPath.length < 2) {
+                relPath.unshift('');
+            }
+            result.pathname = relPath.join('/');
         } else {
-            relPath = (relative.pathname || "").split("/");
-            for (; relPath.length && !(relative.host = relPath.shift());) {}
-            relative.host || (relative.host = "");
-            relative.hostname || (relative.hostname = "");
-            "" !== relPath[0] && relPath.unshift("");
-            relPath.length < 2 && relPath.unshift("");
-            result.pathname = relPath.join("/");
+            result.pathname = relative.pathname;
         }
         result.search = relative.search;
         result.query = relative.query;
-        result.host = relative.host || "";
+        result.host = relative.host || '';
         result.auth = relative.auth;
         result.hostname = relative.hostname || relative.host;
         result.port = relative.port;
+        // to support http.request
         if (result.pathname || result.search) {
-            p = result.pathname || "";
-            s = result.search || "";
+            p = result.pathname || '';
+            s = result.search || '';
             result.path = p + s;
         }
         result.slashes = result.slashes || relative.slashes;
         result.href = result.format();
         return result;
     }
-    isSourceAbs = result.pathname && "/" === result.pathname.charAt(0), isRelAbs = relative.host || relative.pathname && "/" === relative.pathname.charAt(0),
-        mustEndAbs = isRelAbs || isSourceAbs || result.host && relative.pathname, removeAllDots = mustEndAbs, srcPath = result.pathname && result.pathname.split("/") || [],
-        relPath = relative.pathname && relative.pathname.split("/") || [], psychotic = result.protocol && !slashedProtocol[result.protocol];
+
+    isSourceAbs = (result.pathname && result.pathname.charAt(0) === '/');
+    isRelAbs = (
+        relative.host ||
+        relative.pathname && relative.pathname.charAt(0) === '/'
+    );
+    mustEndAbs = (isRelAbs || isSourceAbs || (result.host && relative.pathname));
+    removeAllDots = mustEndAbs;
+    srcPath = result.pathname && result.pathname.split('/') || [];
+    relPath = relative.pathname && relative.pathname.split('/') || [];
+    psychotic = result.protocol && !slashedProtocol[result.protocol];
+
+    // if the url is a non-slashed url, then relative
+    // links like ../.. should be able
+    // to crawl up to the hostname, as well.  This is strange.
+    // result.protocol has already been set by now.
+    // Later on, put the first path part into the host field.
     if (psychotic) {
-        result.hostname = "";
+        result.hostname = '';
         result.port = null;
-        result.host && ("" === srcPath[0] ? srcPath[0] = result.host : srcPath.unshift(result.host));
-        result.host = "";
+        if (result.host) {
+            if (srcPath[0] === '') {
+                srcPath[0] = result.host;
+            } else {
+                srcPath.unshift(result.host);
+            }
+        }
+        result.host = '';
         if (relative.protocol) {
             relative.hostname = null;
             relative.port = null;
-            relative.host && ("" === relPath[0] ? relPath[0] = relative.host : relPath.unshift(relative.host));
+            result.auth = null;
+            if (relative.host) {
+                if (relPath[0] === '') {
+                    relPath[0] = relative.host;
+                } else {
+                    relPath.unshift(relative.host);
+                }
+            }
             relative.host = null;
         }
-        mustEndAbs = mustEndAbs && ("" === relPath[0] || "" === srcPath[0]);
+        mustEndAbs = mustEndAbs && (relPath[0] === '' || srcPath[0] === '');
     }
+
     if (isRelAbs) {
-        result.host = relative.host || "" === relative.host ? relative.host : result.host;
-        result.hostname = relative.hostname || "" === relative.hostname ? relative.hostname : result.hostname;
+        // it's absolute.
+        if (relative.host || relative.host === '') {
+            if (result.host !== relative.host) {
+                result.auth = null;
+            }
+            result.host = relative.host;
+            result.port = relative.port;
+        }
+        if (relative.hostname || relative.hostname === '') {
+            if (result.hostname !== relative.hostname) {
+                result.auth = null;
+            }
+            result.hostname = relative.hostname;
+        }
         result.search = relative.search;
         result.query = relative.query;
         srcPath = relPath;
-    } else {
-        if (relPath.length) {
-            srcPath || (srcPath = []);
-            srcPath.pop();
-            srcPath = srcPath.concat(relPath);
-            result.search = relative.search;
-            result.query = relative.query;
-        } else {
-            if (!isNullOrUndefined(relative.search)) {
-                if (psychotic) {
-                    result.hostname = result.host = srcPath.shift();
-                    authInHost = result.host && result.host.indexOf("@") > 0 ? result.host.split("@") : false;
-                    if (authInHost) {
-                        result.auth = authInHost.shift();
-                        result.host = result.hostname = authInHost.shift();
-                    }
-                }
-                result.search = relative.search;
-                result.query = relative.query;
-                isNull(result.pathname) && isNull(result.search) || (result.path = (result.pathname ? result.pathname : "") + (result.search ? result.search : ""));
-                result.href = result.format();
-                return result;
+        // fall through to the dot-handling below.
+    } else if (relPath.length) {
+        // it's relative
+        // throw away the existing file, and take the new path instead.
+        if (!srcPath) {
+            srcPath = [];
+        }
+        srcPath.pop();
+        srcPath = srcPath.concat(relPath);
+        result.search = relative.search;
+        result.query = relative.query;
+    } else if (isNull(relative.search) && relative.search !== undefined) {
+        // just pull out the search.
+        // like href='?foo'.
+        // Put this after the other two cases because it simplifies the booleans
+        if (psychotic) {
+            result.hostname = result.host = srcPath.shift();
+            //occasionally the auth can get stuck only in host
+            //this especially happens in cases like
+            //url.resolveObject('mailto:local1@domain1', 'local2@domain2')
+            authInHost = result.host && result.host.indexOf('@') > 0 ?
+                result.host.split('@') : false;
+            if (authInHost) {
+                result.auth = authInHost.shift();
+                result.host = result.hostname = authInHost.shift();
             }
         }
-    }
-    if (!srcPath.length) {
-        result.pathname = null;
-        result.path = result.search ? "/" + result.search : null;
+        result.search = relative.search;
+        result.query = relative.query;
+        //to support http.request
+        if (isNull(result.pathname) || isNull(result.search)) {
+            result.path = (result.pathname ? result.pathname : '') +
+                (result.search ? result.search : '');
+        }
         result.href = result.format();
         return result;
     }
-    last = srcPath.slice(-1)[0];
-    hasTrailingSlash = (result.host || relative.host) && ("." === last || ".." === last) || "" === last;
-    up = 0;
-    for (i = srcPath.length; i >= 0; i--) {
-        last = srcPath[i];
-        if ("." === last) {
-            srcPath.splice(i, 1);
+
+    if (!srcPath.length) {
+        // no path at all.  easy.
+        // we've already handled the other stuff above.
+        result.pathname = null;
+        //to support http.request
+        if (result.search) {
+            result.path = '/' + result.search;
         } else {
-            if (".." === last) {
-                srcPath.splice(i, 1);
-                up++;
-            } else {
-                if (up) {
-                    srcPath.splice(i, 1);
-                    up--;
-                }
-            }
+            result.path = null;
+        }
+        result.href = result.format();
+
+        return result;
+    }
+
+    // if a url ENDs in . or .., then it must get a trailing slash.
+    // however, if it ends in anything else non-slashy,
+    // then it must NOT get a trailing slash.
+    last = srcPath.slice(-1)[0];
+    hasTrailingSlash = (
+        (result.host || relative.host || srcPath.length > 1) &&
+        (last === '.' || last === '..') || last === '');
+
+    // strip single dots, resolve double dots to parent dir
+    // if the path tries to go above the root, `up` ends up > 0
+    up = 0;
+    for (i = srcPath.length - 1; i >= 0; i--) {
+        last = srcPath[i];
+        if (last === '.') {
+            spliceOne(srcPath, i);
+        } else if (last === '..') {
+            spliceOne(srcPath, i);
+            up++;
+        } else if (up) {
+            spliceOne(srcPath, i);
+            up--;
         }
     }
+
+    // if the path is allowed to go above the root, restore leading ..s
     if (!mustEndAbs && !removeAllDots) {
         for (; up--; up) {
-            srcPath.unshift("..");
+            srcPath.unshift('..');
         }
     }
 
-    !mustEndAbs || "" === srcPath[0] || srcPath[0] && "/" === srcPath[0].charAt(0) || srcPath.unshift("");
-    hasTrailingSlash && "/" !== srcPath.join("/").substr(-1) && srcPath.push("");
-    isAbsolute = "" === srcPath[0] || srcPath[0] && "/" === srcPath[0].charAt(0);
+    if (mustEndAbs && srcPath[0] !== '' && (!srcPath[0] || srcPath[0].charAt(0) !== '/')) {
+        srcPath.unshift('');
+    }
 
+    if (hasTrailingSlash && (srcPath.join('/').substr(-1) !== '/')) {
+        srcPath.push('');
+    }
+
+    isAbsolute = srcPath[0] === '' || (srcPath[0] && srcPath[0].charAt(0) === '/');
+
+    // put the host back
     if (psychotic) {
-        result.hostname = result.host = isAbsolute ? "" : srcPath.length ? srcPath.shift() : "";
-        authInHost = result.host && result.host.indexOf("@") > 0 ? result.host.split("@") : false;
+        result.hostname = result.host = isAbsolute ? '' : srcPath.length ? srcPath.shift() : '';
+        //occasionally the auth can get stuck only in host
+        //this especially happens in cases like
+        //url.resolveObject('mailto:local1@domain1', 'local2@domain2')
+        authInHost = result.host && result.host.indexOf('@') > 0 ?
+            result.host.split('@') : false;
         if (authInHost) {
             result.auth = authInHost.shift();
             result.host = result.hostname = authInHost.shift();
         }
     }
-    mustEndAbs = mustEndAbs || result.host && srcPath.length;
-    mustEndAbs && !isAbsolute && srcPath.unshift("");
-    if (srcPath.length) {
-        result.pathname = srcPath.join("/");
-    } else {
+
+    mustEndAbs = mustEndAbs || (result.host && srcPath.length);
+
+    if (mustEndAbs && !isAbsolute) {
+        srcPath.unshift('');
+    }
+
+    if (!srcPath.length) {
         result.pathname = null;
         result.path = null;
+    } else {
+        result.pathname = srcPath.join('/');
     }
-    isNull(result.pathname) && isNull(result.search) || (result.path = (result.pathname ? result.pathname : "") + (result.search ? result.search : ""));
+
+    //to support request.http
+    if (isNull(result.pathname) || isNull(result.search)) {
+        result.path = (result.pathname ? result.pathname : '') + (result.search ? result.search : '');
+    }
     result.auth = relative.auth || result.auth;
     result.slashes = result.slashes || relative.slashes;
     result.href = result.format();
+
     return result;
 };
 
 Url.prototype.parseHost = function() {
     var host = this.host,
         port = portPattern.exec(host);
+
     if (port) {
         port = port[0];
-        ":" !== port && (this.port = port.substr(1));
-        host = host.substr(0, host.length - port.length);
+        if (port !== ':') {
+            this.port = port.slice(1);
+        }
+        host = host.slice(0, host.length - port.length);
     }
-    host && (this.hostname = host);
+    if (host) {
+        this.hostname = host;
+    }
 };
 
+// About 1.5x faster than the two-arg version of Array#splice().
+function spliceOne(list, index) {
+    var i = index,
+        k = i + 1,
+        n = list.length;
 
-url.parse = urlParse;
-url.resolve = urlResolve;
-url.resolveObject = urlResolveObject;
-url.format = urlFormat;
-url.Url = Url;
+    for (; k < n; i += 1, k += 1) {
+        list[i] = list[k];
+    }
+    list.pop();
+}
+
+var hexTable = new Array(256);
+for (var i = 0; i < 256; ++i) {
+    hexTable[i] = '%' + ((i < 16 ? '0' : '') + i.toString(16)).toUpperCase();
+}
+
+function encodeAuth(str) {
+    // faster encodeURIComponent alternative for encoding auth uri components
+    var out = '',
+        lastPos = 0,
+        i, c, c2;
+
+    for (i = 0; i < str.length; ++i) {
+        c = str.charCodeAt(i);
+
+        // These characters do not need escaping:
+        // ! - . _ ~
+        // ' ( ) * :
+        // digits
+        // alpha (uppercase)
+        // alpha (lowercase)
+        if (c === 0x21 || c === 0x2D || c === 0x2E || c === 0x5F || c === 0x7E ||
+            (c >= 0x27 && c <= 0x2A) ||
+            (c >= 0x30 && c <= 0x3A) ||
+            (c >= 0x41 && c <= 0x5A) ||
+            (c >= 0x61 && c <= 0x7A)) {
+            continue;
+        }
+
+        if (i - lastPos > 0) {
+            out += str.slice(lastPos, i);
+        }
+
+        lastPos = i + 1;
+
+        // Other ASCII characters
+        if (c < 0x80) {
+            out += hexTable[c];
+            continue;
+        }
+
+        // Multi-byte characters ...
+        if (c < 0x800) {
+            out += hexTable[0xC0 | (c >> 6)] + hexTable[0x80 | (c & 0x3F)];
+            continue;
+        }
+        if (c < 0xD800 || c >= 0xE000) {
+            out += hexTable[0xE0 | (c >> 12)] +
+                hexTable[0x80 | ((c >> 6) & 0x3F)] +
+                hexTable[0x80 | (c & 0x3F)];
+            continue;
+        }
+        // Surrogate pair
+        ++i;
+        c2;
+        if (i < str.length) {
+            c2 = str.charCodeAt(i) & 0x3FF;
+        } else {
+            c2 = 0;
+        }
+        c = 0x10000 + (((c & 0x3FF) << 10) | c2);
+        out += hexTable[0xF0 | (c >> 18)] +
+            hexTable[0x80 | ((c >> 12) & 0x3F)] +
+            hexTable[0x80 | ((c >> 6) & 0x3F)] +
+            hexTable[0x80 | (c & 0x3F)];
+    }
+    if (lastPos === 0) {
+        return str;
+    }
+    if (lastPos < str.length) {
+        return out + str.slice(lastPos);
+    }
+    return out;
+}
